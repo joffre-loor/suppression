@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+numpy
+librosa
+tensorflow
+tensorflow-hub
+scipy
+requests
