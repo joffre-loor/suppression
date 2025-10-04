@@ -1,0 +1,40 @@
+# env & IDE
+.venv/
+.env
+.DS_Store
+.vscode/
+__pycache__/
+
+# build / caches
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# audio artifacts
+*.wav
+*.mp3
+*.flac
+recordings/
+logs/
+
+# model/checkpoint/binaries
+*.pth
+*.pt
+*.onnx
+*.tflite
+*.pb
+*.ckpt
+*.zip
+*.tar
+*.tar.gz
+panns_data/
+yamnet/
+models/
+checkpoints/
+
+# datasets
+data/
+datasets/
