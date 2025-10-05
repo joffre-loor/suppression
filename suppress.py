@@ -1,54 +1,16 @@
 #!/usr/bin/env python3
-# Extreme suppression, spectral-mask + proper OLA, prompt hot-reload
-# Multi-target (union) prompts, DTYPE-SAFE (float32 end-to-end)
+# realtime_filter.py
+# Mac mic -> model -> XM5 headphones. Control via suppress_api.py.
+# Uses AudioSep separation + EXTREME spectral masking + OLA. Polls API for {mode, classes}.
 
-import os, sys, time, tempfile, io, contextlib
+import os, sys, time, tempfile, io, contextlib, threading
 from pathlib import Path
 import numpy as np
 import sounddevice as sd
-import soundfile as sf  
+import soundfile as sf
 from scipy.signal import get_window
 from datetime import datetime
 import requests
-import threading
-
-API_BASE = os.getenv("SUPPRESS_API_BASE", "http://127.0.0.1:8000")
-DEFAULT_PROMPT = "music"
-DEFAULT_MODE   = "drop"
-
-class ControlState:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.mode = DEFAULT_MODE
-        self.prompts = [DEFAULT_PROMPT]
-        self.version = -1
-    def update_from_api(self, d: dict):
-        with self.lock:
-            self.mode = d.get("mode", DEFAULT_MODE)
-            clz = d.get("classes", [])
-            self.prompts = clz if clz else [DEFAULT_PROMPT]
-            self.version = d.get("version", self.version)
-    def snapshot(self):
-        with self.lock:
-            return self.mode, list(self.prompts), self.version
-
-CTRL = ControlState()
-
-def poll_control_state(stop_event: threading.Event, every_sec=0.25):
-    url = f"{API_BASE}/suppress/current"
-    last_version = None
-    while not stop_event.is_set():
-        try:
-            r = requests.get(url, timeout=0.6)
-            r.raise_for_status()
-            CTRL.update_from_api(r.json())
-            m, p, v = CTRL.snapshot()
-            if v != last_version:
-                last_version = v
-                print(f"[CTRL] mode={m} prompts={p} v={v}", flush=True)
-        except Exception:
-            pass
-        stop_event.wait(every_sec)
 
 # =========================
 # Devices (by name contains)
@@ -66,39 +28,77 @@ if str(AUDIOSEP_REPO) not in sys.path:
 import torch
 from pipeline import build_audiosep, separate_audio as inference
 
+# =========================
+# Control plane
+# =========================
+API_BASE = os.getenv("SUPPRESS_API_BASE", "http://127.0.0.1:8000")  # change to your laptop IP
+
+DEFAULT_PROMPT = "music"
+DEFAULT_MODE   = "drop"
+
+class ControlState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.mode = DEFAULT_MODE
+        self.prompts = [DEFAULT_PROMPT]
+        self.version = -1
+
+    def update_from_api(self, d: dict):
+        with self.lock:
+            self.mode = d.get("mode", DEFAULT_MODE)
+            clz = d.get("classes", [])
+            self.prompts = clz if clz else [DEFAULT_PROMPT]
+            self.version = d.get("version", self.version)
+
+    def snapshot(self):
+        with self.lock:
+            return self.mode, list(self.prompts), self.version
+
+CTRL = ControlState()
+
+def poll_control_state(stop_event: threading.Event, every_sec=0.25):
+    url = f"{API_BASE}/suppress/current"
+    last_version = None
+    while not stop_event.is_set():
+        try:
+            r = requests.get(url, timeout=0.5)
+            r.raise_for_status()
+            CTRL.update_from_api(r.json())
+            _, _, v = CTRL.snapshot()
+            if v != last_version:
+                last_version = v
+                print(f"[CTRL] mode={CTRL.mode} prompts={CTRL.prompts} v={v}", flush=True)
+        except Exception:
+            pass
+        stop_event.wait(every_sec)
 
 # =========================
 # Defaults / I/O params
 # =========================
-DEFAULT_PROMPT = "music"
-DEFAULT_MODE   = "drop"           # or "keep"
-
 SR        = 32000
 CHUNK_S   = 1.0                   # analysis window (seconds)
 HOP_S     = 0.5                   # 50% overlap
 CHANNELS  = 1
-PROMPT_FILE = Path("filter_list.txt")
-RELOAD_EVERY_SEC = 0.25
 
 # =========================
-# EXTREME spectral mask params (more aggressive)
+# EXTREME spectral mask params
 # =========================
-NFFT          = 4096              # higher = better freq selectivity (more CPU)
+NFFT          = 4096
 HOP           = NFFT // 2
 WIN           = get_window("hann", NFFT).astype(np.float32)
 WIN_SQ        = (WIN * WIN).astype(np.float32)
 EPS           = np.float32(1e-7)
 
-P_MASK        = 4.0               # Wiener exponent (peakier mask)
-ALPHA_DROP    = 0.999             # mask scale in DROP
-ALPHA_KEEP    = 1.00              # mask scale in KEEP
-MASK_GAMMA    = 1.8               # mask sharpening (>1)
-DROP_POWER    = 2.0               # compound drop power
-DROP_FLOOR_DB = -70.0             # min per-bin gain in DROP
+P_MASK        = 4.0
+ALPHA_DROP    = 0.999
+ALPHA_KEEP    = 1.00
+MASK_GAMMA    = 1.8
+DROP_POWER    = 2.0
+DROP_FLOOR_DB = -70.0
 
-TWO_PASS      = True              # run a second pass on residual (DROP only)
+TWO_PASS      = True
 
-# Presence / gating (minor alpha modulation only)
+# Presence / gating
 SEP_GATE_DB   = -45.0
 ATTACK_COEFF  = 0.25
 RELEASE_COEFF = 0.08
@@ -181,50 +181,7 @@ def postprocess(x: np.ndarray) -> np.ndarray:
     return y.astype(np.float32, copy=False)
 
 # =========================
-# Multi-target prompt parsing
-# =========================
-def _split_items(s: str):
-    s = s.strip()
-    if s.startswith("[") and s.endswith("]"):
-        s = s[1:-1]
-    parts = [p.strip() for p in s.split(",")]
-    if len(parts) == 1 and " " in parts[0]:
-        parts = [p for p in parts[0].split() if p]
-    return [p for p in parts if p]
-
-def parse_prompt_file(p: Path):
-    mode = DEFAULT_MODE
-    items = []
-    try:
-        txt = p.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        print("[WARN] prompt file not readable; using defaults")
-        return [DEFAULT_PROMPT], mode
-    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
-    if not lines:
-        print("[WARN] prompt file empty; using defaults")
-        return [DEFAULT_PROMPT], mode
-
-    for ln in lines:
-        low = ln.lower()
-        if low.startswith("drop:"):
-            mode = "drop"
-            payload = ln.split(":",1)[1].strip()
-            items += _split_items(payload)
-        elif low.startswith("keep:"):
-            mode = "keep"
-            payload = ln.split(":",1)[1].strip()
-            items += _split_items(payload)
-        elif low.startswith("[") and low.endswith("]"):
-            mode = "drop"
-            items += _split_items(ln)
-        else:
-            items.append(ln)
-    items = [it for it in (it.strip() for it in items) if it]
-    return (items or [DEFAULT_PROMPT]), mode
-
-# =========================
-# STFT / ISTFT (Hann, 50% hop) — float32-safe
+# STFT / ISTFT (Hann, 50% hop)
 # =========================
 def stft(x: np.ndarray) -> np.ndarray:
     x = x.astype(np.float32, copy=False)
@@ -355,7 +312,7 @@ assert hop_len * 2 == chunk_len, "Use 50% overlap for clean OLA."
 # Hann for outer OLA (frame domain)
 syn_win = get_window("hann", chunk_len).astype(np.float32)
 
-# Rolling input buffer (last chunk_len samples)
+# Rolling input buffer
 in_ring  = np.zeros(chunk_len, dtype=np.float32)
 in_write = 0
 filled   = 0
@@ -363,36 +320,28 @@ filled   = 0
 # OLA buffer spanning one chunk; read hop_len each hop
 ola_buf = np.zeros(chunk_len, dtype=np.float32)
 
-# Prompt hot-reload (content-hash)
-current_prompts, current_mode = parse_prompt_file(PROMPT_FILE)  # list[str], mode
-_last_check = 0.0
-_last_hash  = None
-print(f"[INFO] Initial target -> mode='{current_mode}' prompts={current_prompts}", flush=True)
-print(f"[INFO] Watching prompt file at: {PROMPT_FILE.resolve()}")
+print(f"[INFO] Capturing to:\n  BEFORE: {INPUT_WAV_PATH}\n  AFTER : {OUTPUT_WAV_PATH}")
+input_sink  = sf.SoundFile(str(INPUT_WAV_PATH),  mode="w", samplerate=SR, channels=1, subtype="PCM_16")
+output_sink = sf.SoundFile(str(OUTPUT_WAV_PATH), mode="w", samplerate=SR, channels=1, subtype="PCM_16")
 
-def file_text_or_none(p: Path):
-    try: return p.read_text(encoding="utf-8", errors="ignore")
-    except Exception: return None
+print("[INFO] Running (50% OLA + EXTREME spectral mask + multi-target). Ctrl+C to stop.", flush=True)
 
-def maybe_reload_prompt():
-    global current_prompts, current_mode, _last_check, _last_hash
-    now = time.time()
-    if now - _last_check < RELOAD_EVERY_SEC: return
-    _last_check = now
-    txt = file_text_or_none(PROMPT_FILE)
-    if txt is None: return
-    h = hash(txt)
-    if h == _last_hash: return
-    _last_hash = h
-    prompts, md = parse_prompt_file(PROMPT_FILE)
-    md = (md or DEFAULT_MODE).strip().lower()
-    if prompts != current_prompts or md != current_mode:
-        current_prompts, current_mode = prompts, md
-        print(f"[INFO] Updated target -> mode='{current_mode}' prompts={current_prompts}", flush=True)
+_dc_state = [np.float32(0.0)]
+have_processed_once = False
 
-# Device resolve
+# Temp WAVs for model I/O
+tmpdir = tempfile.TemporaryDirectory()
+mix_wav = Path(tmpdir.name) / "chunk_mix.wav"
+sep_wav = Path(tmpdir.name) / "chunk_sep.wav"
+
+# Presence controllers
+smoother = OnePole()
+gate     = HoldGate()
+
+# Start control poller
 stop_poll = threading.Event()
-threading.Thread(target=poll_control_state, args=(stop_poll,), daemon=True).start()
+t = threading.Thread(target=poll_control_state, args=(stop_poll,), daemon=True)
+t.start()
 
 def find_device_by_name(target_name: str, want_input: bool):
     name_lower = target_name.lower()
@@ -422,50 +371,30 @@ if OUTPUT_DEVICE_INDEX is None:
 sd.check_input_settings(device=INPUT_DEVICE_INDEX, channels=CHANNELS, samplerate=SR, dtype="float32")
 sd.check_output_settings(device=OUTPUT_DEVICE_INDEX, channels=CHANNELS, samplerate=SR, dtype="float32")
 
-# Files
-print(f"[INFO] Capturing to:\n  BEFORE: {INPUT_WAV_PATH}\n  AFTER : {OUTPUT_WAV_PATH}")
-input_sink  = sf.SoundFile(str(INPUT_WAV_PATH),  mode="w", samplerate=SR, channels=1, subtype="PCM_16")
-output_sink = sf.SoundFile(str(OUTPUT_WAV_PATH), mode="w", samplerate=SR, channels=1, subtype="PCM_16")
-
-print("[INFO] Running (50% OLA + EXTREME spectral mask + multi-target). Ctrl+C to stop.", flush=True)
-
-_dc_state = [np.float32(0.0)]
-have_processed_once = False
-
-# Temp WAVs for model I/O
-tmpdir = tempfile.TemporaryDirectory()
-mix_wav = Path(tmpdir.name) / "chunk_mix.wav"
-sep_wav = Path(tmpdir.name) / "chunk_sep.wav"
-
-# Presence controllers (minor alpha modulation only)
-smoother = OnePole()
-gate     = HoldGate()
-
 try:
     with sd.Stream(device=(INPUT_DEVICE_INDEX, OUTPUT_DEVICE_INDEX),
                    samplerate=SR, blocksize=hop_len, dtype="float32",
                    channels=CHANNELS, latency="low") as stream:
         while True:
-            maybe_reload_prompt()
+            mode_now, prompts_now, _ = CTRL.snapshot()
 
             frames, _ = stream.read(hop_len)
             x = to_mono(frames)
             x = dc_block(x, _dc_state)
             input_sink.write(x)
 
-            # Playback front half of OLA (ensure float32)
+            # play last half from OLA
             out_seg = ola_buf[:hop_len].astype(np.float32, copy=False)
             out_seg = postprocess(out_seg)
             output_sink.write(out_seg)
             write_buf = out_seg if have_processed_once else np.zeros(out_seg.shape, dtype=np.float32)
-            write_buf = write_buf.astype(np.float32, copy=False)
             stream.write(write_buf[:, None])
 
-            # Roll OLA by hop
+            # shift OLA
             ola_buf[:-hop_len] = ola_buf[hop_len:]
             ola_buf[-hop_len:] = np.float32(0.0)
 
-            # Update in_ring with new audio
+            # rolling input buffer
             end = in_write + hop_len
             if end <= len(in_ring):
                 in_ring[in_write:end] = x
@@ -479,7 +408,7 @@ try:
             if filled < chunk_len:
                 continue
 
-            # Extract analysis chunk
+            # extract analysis chunk
             if in_write - chunk_len >= 0:
                 chunk = in_ring[in_write - chunk_len:in_write].copy()
             else:
@@ -487,10 +416,10 @@ try:
                 b = in_ring[:in_write].copy()
                 chunk = np.concatenate([a, b]).astype(np.float32, copy=False)
 
-            # === Multi-target separation and union mask ===
+            # Separate per prompt and union masks
             try:
                 sep_list = []
-                for prompt in current_prompts:
+                for prompt in prompts_now:
                     sf.write(mix_wav, chunk, SR)
                     buf = io.StringIO()
                     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
@@ -504,46 +433,40 @@ try:
                     sep = sep[:len(chunk)].astype(np.float32, copy=False)
                     sep_list.append(sep)
 
-                # Presence (use loudest separated stem)
+                # Presence estimate
                 pr_raw = 0.0 if not sep_list else float(np.clip(max(rms(s) for s in sep_list) / (rms(chunk) + 1e-9), 0.0, 1.0))
-                pr_s   = smoother(pr_raw)
+                pr_s   = OnePole()(pr_raw)  # fresh smoother for each frame
                 pr_g   = gate.update(pr_s)
                 presence = pr_s * pr_g
 
-                # Choose alpha
-                alpha = ALPHA_KEEP * (0.8 + 0.2 * presence) if current_mode == "keep" else ALPHA_DROP
+                alpha = ALPHA_KEEP * (0.8 + 0.2 * presence) if mode_now == "keep" else ALPHA_DROP
 
-                # Multi-target spectral suppression
-                proc = spectral_drop_or_keep_multi(chunk, sep_list, current_mode,
-                                                   alpha_drop=alpha, alpha_keep=alpha,
-                                                   p=P_MASK, gamma=MASK_GAMMA,
-                                                   drop_power=DROP_POWER, drop_floor_db=DROP_FLOOR_DB)
+                proc = spectral_drop_or_keep_multi(
+                    chunk, sep_list, mode_now,
+                    alpha_drop=alpha, alpha_keep=alpha,
+                    p=P_MASK, gamma=MASK_GAMMA,
+                    drop_power=DROP_POWER, drop_floor_db=DROP_FLOOR_DB
+                )
 
-                # Optional second pass (DROP only)
-                if TWO_PASS and current_mode == "drop":
+                if TWO_PASS and mode_now == "drop":
                     resid = (chunk - proc).astype(np.float32, copy=False)
-                    proc  = spectral_drop_or_keep_multi(proc, [resid], "drop",
-                                                        alpha_drop=min(0.9995, ALPHA_DROP * 1.01),
-                                                        alpha_keep=ALPHA_KEEP,
-                                                        p=max(P_MASK, 4.0), gamma=max(MASK_GAMMA, 1.8),
-                                                        drop_power=max(DROP_POWER, 2.0),
-                                                        drop_floor_db=DROP_FLOOR_DB)
+                    proc  = spectral_drop_or_keep_multi(
+                        proc, [resid], "drop",
+                        alpha_drop=min(0.9995, ALPHA_DROP * 1.01),
+                        alpha_keep=ALPHA_KEEP,
+                        p=max(P_MASK, 4.0),
+                        gamma=max(MASK_GAMMA, 1.8),
+                        drop_power=max(DROP_POWER, 2.0),
+                        drop_floor_db=DROP_FLOOR_DB
+                    )
 
-                # Outer OLA (window then add)
-                proc = proc.astype(np.float32, copy=False)
                 proc_win = (proc * syn_win).astype(np.float32, copy=False)
                 ola_buf += proc_win
                 have_processed_once = True
 
-                # Debug (light)
-                if int(time.time() * 2) % 2 == 0:
-                    print(f"[DBG] mode={current_mode} prompts={current_prompts} "
-                          f"mix={lin_to_db(rms(chunk)):5.1f}dB "
-                          f"presence={presence:0.3f} alpha={alpha:0.3f}", flush=True)
-
             except Exception as e:
                 print(f"[WARN] separation failed: {e}", flush=True)
-                # keep streaming; try again next hop
+                # keep streaming
 
 except KeyboardInterrupt:
     print("\n[INFO] Stopping and closing files...")
