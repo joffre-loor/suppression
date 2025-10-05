@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # Extreme suppression, spectral-mask + proper OLA, prompt hot-reload
-# DTYPE-SAFE (float32 end-to-end)
+# Multi-target (union) prompts, DTYPE-SAFE (float32 end-to-end)
 
 import os, sys, time, tempfile, io, contextlib
 from pathlib import Path
 import numpy as np
 import sounddevice as sd
-import soundsfile as sf
+import soundfile as sf  
 from scipy.signal import get_window
 from datetime import datetime
 
@@ -57,7 +57,7 @@ DROP_FLOOR_DB = -70.0             # min per-bin gain in DROP
 
 TWO_PASS      = True              # run a second pass on residual (DROP only)
 
-# Presence / gating (only modulates alpha slightly)
+# Presence / gating (minor alpha modulation only)
 SEP_GATE_DB   = -45.0
 ATTACK_COEFF  = 0.25
 RELEASE_COEFF = 0.08
@@ -139,26 +139,48 @@ def postprocess(x: np.ndarray) -> np.ndarray:
     y = soft_limiter(x, OUTPUT_SOFT_LIMIT_DB)
     return y.astype(np.float32, copy=False)
 
+# =========================
+# Multi-target prompt parsing
+# =========================
+def _split_items(s: str):
+    s = s.strip()
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1]
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) == 1 and " " in parts[0]:
+        parts = [p for p in parts[0].split() if p]
+    return [p for p in parts if p]
+
 def parse_prompt_file(p: Path):
+    mode = DEFAULT_MODE
+    items = []
     try:
         txt = p.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         print("[WARN] prompt file not readable; using defaults")
-        return DEFAULT_PROMPT, DEFAULT_MODE
+        return [DEFAULT_PROMPT], mode
     lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
     if not lines:
         print("[WARN] prompt file empty; using defaults")
-        return DEFAULT_PROMPT, DEFAULT_MODE
+        return [DEFAULT_PROMPT], mode
+
     for ln in lines:
         low = ln.lower()
         if low.startswith("drop:"):
-            val = low.split("drop:",1)[1].strip(" []\t"); return (val or DEFAULT_PROMPT), "drop"
-        if low.startswith("keep:"):
-            val = low.split("keep:",1)[1].strip(" []\t"); return (val or DEFAULT_PROMPT), "keep"
-        if low.startswith("[") and low.endswith("]") and len(low)>2:
-            val = low[1:-1].strip(); return (val or DEFAULT_PROMPT), "drop"
-    print("[WARN] no directive found; using defaults")
-    return DEFAULT_PROMPT, DEFAULT_MODE
+            mode = "drop"
+            payload = ln.split(":",1)[1].strip()
+            items += _split_items(payload)
+        elif low.startswith("keep:"):
+            mode = "keep"
+            payload = ln.split(":",1)[1].strip()
+            items += _split_items(payload)
+        elif low.startswith("[") and low.endswith("]"):
+            mode = "drop"
+            items += _split_items(ln)
+        else:
+            items.append(ln)
+    items = [it for it in (it.strip() for it in items) if it]
+    return (items or [DEFAULT_PROMPT]), mode
 
 # =========================
 # STFT / ISTFT (Hann, 50% hop) — float32-safe
@@ -194,16 +216,13 @@ def istft(X: np.ndarray) -> np.ndarray:
     y /= wsum
     return y.astype(np.float32, copy=False)
 
+# =========================
+# Spectral masking (single and multi-target union)
+# =========================
 def spectral_drop_or_keep(mix: np.ndarray, sep: np.ndarray, mode: str,
                           alpha_drop=ALPHA_DROP, alpha_keep=ALPHA_KEEP,
                           p=P_MASK, gamma=MASK_GAMMA, drop_power=DROP_POWER,
                           drop_floor_db=DROP_FLOOR_DB) -> np.ndarray:
-    """
-    Aggressive spectral mask:
-      - Wiener-style mask M with exponent p
-      - Sharpening by gamma (M**gamma)
-      - Drop: (1 - alpha*M)**drop_power, floored at drop_floor_db
-    """
     X = stft(mix)
     S = stft(sep)
     F = max(X.shape[0], S.shape[0])
@@ -211,16 +230,13 @@ def spectral_drop_or_keep(mix: np.ndarray, sep: np.ndarray, mode: str,
         X = np.vstack([X, np.zeros((F - X.shape[0], X.shape[1]), dtype=X.dtype)])
     if S.shape[0] < F:
         S = np.vstack([S, np.zeros((F - S.shape[0], S.shape[1]), dtype=S.dtype)])
-
     aX = np.abs(X).astype(np.float32, copy=False)
     aS = np.abs(S).astype(np.float32, copy=False)
     aR = np.clip(aX - aS, 0.0, None).astype(np.float32, copy=False)
-
     M = (aS**p) / (aS**p + aR**p + EPS)
     M = np.clip(M, 0.0, 1.0).astype(np.float32, copy=False)
     if gamma != 1.0:
         M = (M ** np.float32(gamma)).astype(np.float32, copy=False)
-
     if mode == "keep":
         A = np.float32(alpha_keep)
         Y = (M * A).astype(np.float32, copy=False) * X
@@ -228,6 +244,46 @@ def spectral_drop_or_keep(mix: np.ndarray, sep: np.ndarray, mode: str,
         A = np.float32(alpha_drop)
         floor_lin = np.float32(10.0 ** (drop_floor_db / 20.0))
         G = np.clip(1.0 - (A * M), floor_lin, 1.0).astype(np.float32, copy=False)
+        if drop_power != 1.0:
+            G = (G ** np.float32(drop_power)).astype(np.float32, copy=False)
+        Y = G * X
+    y = istft(Y)
+    if len(y) > len(mix): y = y[:len(mix)]
+    elif len(y) < len(mix): y = np.pad(y, (0, len(mix)-len(y)), mode='constant')
+    return y.astype(np.float32, copy=False)
+
+def spectral_drop_or_keep_multi(mix: np.ndarray, sep_list, mode: str,
+                                alpha_drop=ALPHA_DROP, alpha_keep=ALPHA_KEEP,
+                                p=P_MASK, gamma=MASK_GAMMA, drop_power=DROP_POWER,
+                                drop_floor_db=DROP_FLOOR_DB) -> np.ndarray:
+    X = stft(mix)
+    aX = np.abs(X).astype(np.float32, copy=False)
+    M_union = np.zeros_like(aX, dtype=np.float32)
+
+    for sep in sep_list:
+        S = stft(sep)
+        F = max(X.shape[0], S.shape[0])
+        if S.shape[0] < F:
+            S = np.vstack([S, np.zeros((F - S.shape[0], S.shape[1]), dtype=S.dtype)])
+        if X.shape[0] < F:
+            X = np.vstack([X, np.zeros((F - X.shape[0], X.shape[1]), dtype=X.dtype)])
+            aX = np.abs(X).astype(np.float32, copy=False)
+
+        aS = np.abs(S).astype(np.float32, copy=False)
+        aR = np.clip(aX - aS, 0.0, None).astype(np.float32, copy=False)
+        M  = (aS**p) / (aS**p + aR**p + EPS)
+        if gamma != 1.0:
+            M = (M ** np.float32(gamma)).astype(np.float32, copy=False)
+        M = np.clip(M, 0.0, 1.0)
+        M_union = np.maximum(M_union, M, out=M_union)
+
+    if mode == "keep":
+        A = np.float32(alpha_keep)
+        Y = (M_union * A).astype(np.float32, copy=False) * X
+    else:
+        A = np.float32(alpha_drop)
+        floor_lin = np.float32(10.0 ** (drop_floor_db / 20.0))
+        G = np.clip(1.0 - (A * M_union), floor_lin, 1.0).astype(np.float32, copy=False)
         if drop_power != 1.0:
             G = (G ** np.float32(drop_power)).astype(np.float32, copy=False)
         Y = G * X
@@ -267,10 +323,10 @@ filled   = 0
 ola_buf = np.zeros(chunk_len, dtype=np.float32)
 
 # Prompt hot-reload (content-hash)
-current_prompt, current_mode = parse_prompt_file(PROMPT_FILE)
+current_prompts, current_mode = parse_prompt_file(PROMPT_FILE)  # list[str], mode
 _last_check = 0.0
 _last_hash  = None
-print(f"[INFO] Initial target -> mode='{current_mode}' prompt='{current_prompt}'", flush=True)
+print(f"[INFO] Initial target -> mode='{current_mode}' prompts={current_prompts}", flush=True)
 print(f"[INFO] Watching prompt file at: {PROMPT_FILE.resolve()}")
 
 def file_text_or_none(p: Path):
@@ -278,7 +334,7 @@ def file_text_or_none(p: Path):
     except Exception: return None
 
 def maybe_reload_prompt():
-    global current_prompt, current_mode, _last_check, _last_hash
+    global current_prompts, current_mode, _last_check, _last_hash
     now = time.time()
     if now - _last_check < RELOAD_EVERY_SEC: return
     _last_check = now
@@ -287,12 +343,11 @@ def maybe_reload_prompt():
     h = hash(txt)
     if h == _last_hash: return
     _last_hash = h
-    pr, md = parse_prompt_file(PROMPT_FILE)
-    pr = (pr or DEFAULT_PROMPT).strip()
+    prompts, md = parse_prompt_file(PROMPT_FILE)
     md = (md or DEFAULT_MODE).strip().lower()
-    if pr != current_prompt or md != current_mode:
-        current_prompt, current_mode = pr, md
-        print(f"[INFO] Updated target -> mode='{current_mode}' prompt='{current_prompt}'", flush=True)
+    if prompts != current_prompts or md != current_mode:
+        current_prompts, current_mode = prompts, md
+        print(f"[INFO] Updated target -> mode='{current_mode}' prompts={current_prompts}", flush=True)
 
 # Device resolve
 def find_device_by_name(target_name: str, want_input: bool):
@@ -328,7 +383,7 @@ print(f"[INFO] Capturing to:\n  BEFORE: {INPUT_WAV_PATH}\n  AFTER : {OUTPUT_WAV_
 input_sink  = sf.SoundFile(str(INPUT_WAV_PATH),  mode="w", samplerate=SR, channels=1, subtype="PCM_16")
 output_sink = sf.SoundFile(str(OUTPUT_WAV_PATH), mode="w", samplerate=SR, channels=1, subtype="PCM_16")
 
-print("[INFO] Running (50% OLA + EXTREME spectral mask). Ctrl+C to stop.", flush=True)
+print("[INFO] Running (50% OLA + EXTREME spectral mask + multi-target). Ctrl+C to stop.", flush=True)
 
 _dc_state = [np.float32(0.0)]
 have_processed_once = False
@@ -358,8 +413,6 @@ try:
             out_seg = ola_buf[:hop_len].astype(np.float32, copy=False)
             out_seg = postprocess(out_seg)
             output_sink.write(out_seg)
-
-            # >>> DTYPE-SAFE WRITE BUFFER <<<
             write_buf = out_seg if have_processed_once else np.zeros(out_seg.shape, dtype=np.float32)
             write_buf = write_buf.astype(np.float32, copy=False)
             stream.write(write_buf[:, None])
@@ -390,47 +443,47 @@ try:
                 b = in_ring[:in_write].copy()
                 chunk = np.concatenate([a, b]).astype(np.float32, copy=False)
 
-            # Run separator
+            # === Multi-target separation and union mask ===
             try:
-                sf.write(mix_wav, chunk, SR)
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                    inference(model, str(mix_wav), current_prompt, str(sep_wav), device)
-                sep, sr_out = sf.read(sep_wav, dtype="float32", always_2d=False)
-                if sr_out != SR:
-                    idx = np.linspace(0, len(sep)-1, len(chunk)).astype(np.float32)
-                    sep = np.interp(idx, np.arange(len(sep), dtype=np.float32), sep.astype(np.float32)).astype(np.float32)
-                if len(sep) < len(chunk):
-                    sep = np.pad(sep.astype(np.float32, copy=False), (0, len(chunk)-len(sep)), mode='constant')
-                sep = sep[:len(chunk)].astype(np.float32, copy=False)
+                sep_list = []
+                for prompt in current_prompts:
+                    sf.write(mix_wav, chunk, SR)
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                        inference(model, str(mix_wav), prompt, str(sep_wav), device)
+                    sep, sr_out = sf.read(sep_wav, dtype="float32", always_2d=False)
+                    if sr_out != SR:
+                        idx = np.linspace(0, len(sep)-1, len(chunk)).astype(np.float32)
+                        sep = np.interp(idx, np.arange(len(sep), dtype=np.float32), sep.astype(np.float32)).astype(np.float32)
+                    if len(sep) < len(chunk):
+                        sep = np.pad(sep.astype(np.float32, copy=False), (0, len(chunk)-len(sep)), mode='constant')
+                    sep = sep[:len(chunk)].astype(np.float32, copy=False)
+                    sep_list.append(sep)
 
-                # Presence (small nudge only)
-                pr_raw = float(np.clip(rms(sep) / (rms(chunk) + 1e-9), 0.0, 1.0))
+                # Presence (use loudest separated stem)
+                pr_raw = 0.0 if not sep_list else float(np.clip(max(rms(s) for s in sep_list) / (rms(chunk) + 1e-9), 0.0, 1.0))
                 pr_s   = smoother(pr_raw)
                 pr_g   = gate.update(pr_s)
                 presence = pr_s * pr_g
 
-                # Choose alpha (DROP at full force)
-                if current_mode == "keep":
-                    alpha = ALPHA_KEEP * (0.8 + 0.2 * presence)
-                else:
-                    alpha = ALPHA_DROP
+                # Choose alpha
+                alpha = ALPHA_KEEP * (0.8 + 0.2 * presence) if current_mode == "keep" else ALPHA_DROP
 
-                # Spectral mask (pass 1)
-                proc = spectral_drop_or_keep(chunk, sep, current_mode,
-                                             alpha_drop=alpha, alpha_keep=alpha,
-                                             p=P_MASK, gamma=MASK_GAMMA,
-                                             drop_power=DROP_POWER, drop_floor_db=DROP_FLOOR_DB)
+                # Multi-target spectral suppression
+                proc = spectral_drop_or_keep_multi(chunk, sep_list, current_mode,
+                                                   alpha_drop=alpha, alpha_keep=alpha,
+                                                   p=P_MASK, gamma=MASK_GAMMA,
+                                                   drop_power=DROP_POWER, drop_floor_db=DROP_FLOOR_DB)
 
-                # Optional second pass on residual for extra depth (DROP only)
+                # Optional second pass (DROP only)
                 if TWO_PASS and current_mode == "drop":
                     resid = (chunk - proc).astype(np.float32, copy=False)
-                    proc  = spectral_drop_or_keep(proc, resid, "drop",
-                                                  alpha_drop=min(0.9995, ALPHA_DROP * 1.01),
-                                                  alpha_keep=ALPHA_KEEP,
-                                                  p=max(P_MASK, 4.0), gamma=max(MASK_GAMMA, 1.8),
-                                                  drop_power=max(DROP_POWER, 2.0),
-                                                  drop_floor_db=DROP_FLOOR_DB)
+                    proc  = spectral_drop_or_keep_multi(proc, [resid], "drop",
+                                                        alpha_drop=min(0.9995, ALPHA_DROP * 1.01),
+                                                        alpha_keep=ALPHA_KEEP,
+                                                        p=max(P_MASK, 4.0), gamma=max(MASK_GAMMA, 1.8),
+                                                        drop_power=max(DROP_POWER, 2.0),
+                                                        drop_floor_db=DROP_FLOOR_DB)
 
                 # Outer OLA (window then add)
                 proc = proc.astype(np.float32, copy=False)
@@ -440,8 +493,8 @@ try:
 
                 # Debug (light)
                 if int(time.time() * 2) % 2 == 0:
-                    print(f"[DBG] mode={current_mode} prompt='{current_prompt}' "
-                          f"mix={lin_to_db(rms(chunk)):5.1f}dB sep={lin_to_db(rms(sep)):5.1f}dB "
+                    print(f"[DBG] mode={current_mode} prompts={current_prompts} "
+                          f"mix={lin_to_db(rms(chunk)):5.1f}dB "
                           f"presence={presence:0.3f} alpha={alpha:0.3f}", flush=True)
 
             except Exception as e:
