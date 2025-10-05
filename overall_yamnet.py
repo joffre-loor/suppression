@@ -1,3 +1,4 @@
+# overall_yamnet_min.py
 import argparse, queue, sys, time, re, os
 from collections import deque
 from math import gcd
@@ -14,6 +15,7 @@ WIN_SECS  = 0.975
 HOP_SECS  = 0.10
 FRAME_LEN = int(WIN_SECS * TARGET_SR)
 
+print("Loading YAMNet…")
 yamnet = hub.load("https://tfhub.dev/google/yamnet/1")
 
 def load_labels():
@@ -25,41 +27,10 @@ def load_labels():
     except Exception:
         return [f"class_{i}" for i in range(521)]
 LABELS = load_labels()
-
-FAMILIES = [
-    ("speech",      r"\bspeech\b|conversation|monologue|speaker|narration|chatter"),
-    ("music",       r"\bmusic\b|song|singing|instrument|piano|guitar|drum|violin|sax|bass|cello|orchestra|choir"),
-    ("keyboard",    r"\bkeyboard\b|typing"),
-    ("mouse",       r"\bmouse\b|click|double[- ]?click|scroll wheel"),
-    ("clicks",      r"\bclick\b|tap|clack|clink|ping|snap|tick|tock|chop|typewriter"),
-    ("hvac",        r"fan|hvac|air conditioning|appliance|vent|ac\b|hum|blower"),
-    ("traffic",     r"traffic|vehicle|car\b|bus|truck|motor|road|highway|intersection"),
-    ("train",       r"\btrain\b|rail|subway|metro|tram"),
-    ("aircraft",    r"airplane|aircraft|jet|helicopter|airport|propeller"),
-    ("bicycle",     r"bicycle|bike|pedal|chain|bell"),
-    ("siren",       r"siren|ambulance|police|fire engine"),
-    ("horn",        r"car horn|horn honk|honk"),
-    ("alarm",       r"\balarm\b|buzzer|beep|timer|smoke alarm"),
-    ("door",        r"door|knock|slam|doorbell"),
-    ("dog",         r"dog|bark|woof|yap|growl"),
-    ("cat",         r"cat|meow|purr|hiss"),
-    ("baby",        r"baby|infant|cry|whimper|coo"),
-    ("laughter",    r"laugh|laughter|giggle|chuckle"),
-    ("cough_sneeze",r"cough|sneeze|sniffle|throat clear|hiccup"),
-    ("footsteps",   r"footstep|walking|running|jog|stomp|heel"),
-    ("crowd",       r"crowd|applause|clap|cheer|audience"),
-    ("kitchen",     r"cooking|frying|sizzle|boil|kettle|microwave|cutlery|dishes|plate|glass"),
-    ("water",       r"water|sink|tap|shower|rain|drip|stream|fountain|flush"),
-    ("weather",     r"wind|storm|thunder|rainstorm|hail"),
-    ("construction",r"construction|hammer|saw|drill|jackhammer|nail gun|sandpaper"),
-    ("office",      r"printer|scanner|photocopier|fax|stapler|paper rustle"),
-    ("camera",      r"camera|shutter|single-lens reflex|dslr|snapshot"),
-    ("phone",       r"phone|ringtone|notification|text tone|vibrate"),
-    ("sports",      r"basketball bounce|tennis|soccer|whistle|skateboard"),
-]
+NUM_CLASSES = len(LABELS)
 
 class EMA:
-    def __init__(self, alpha=0.3):
+    def __init__(self, alpha=0.6):
         self.alpha = float(alpha)
         self.v = None
     def update(self, x: np.ndarray) -> np.ndarray:
@@ -67,43 +38,23 @@ class EMA:
         else: self.v = self.alpha * x + (1 - self.alpha) * self.v
         return self.v
 
-ring = deque(maxlen=FRAME_LEN)
 q = queue.Queue()
-level_ema = 0.0
-
-def meter_update(x: np.ndarray):
-    global level_ema
-    rms = np.sqrt(np.mean(np.square(x))) + 1e-12
-    level_ema = 0.9 * level_ema + 0.1 * rms
-
 def audio_cb(indata, frames, time_info, status):
-    if status: print(status, file=sys.stderr)
+    if status:
+        print(status, file=sys.stderr)
     q.put(indata[:, 0].astype(np.float32, copy=True))
 
-def clearline(use_ansi=True):
-    if use_ansi:
-        sys.stdout.write("\x1b[2K\r")
-        sys.stdout.flush()
-
-def build_family_map():
-    comp = [(name, re.compile(rx, re.I)) for name, rx in FAMILIES]
-    idx_to_fam = [[] for _ in range(len(LABELS))]
-    for i, lab in enumerate(LABELS):
-        for fam_idx, (_, cre) in enumerate(comp):
-            if cre.search(lab):
-                idx_to_fam[i].append(fam_idx)
-    return comp, idx_to_fam
-
 def main(args):
+    # device
     if args.device is None:
         d = sd.default.device
         input_idx = d[0] if isinstance(d, (list, tuple)) else d
     else:
         input_idx = args.device
-
     devinfo = sd.query_devices(input_idx, 'input')
     native_sr = int(devinfo.get("default_samplerate") or 48000)
 
+    # resample ratio native -> TARGET_SR
     up, down = TARGET_SR, native_sr
     g = gcd(up, down); up //= g; down //= g
     hop_native = max(256, int(args.hop * native_sr))
@@ -111,101 +62,166 @@ def main(args):
     ema = EMA(alpha=args.smooth) if args.smooth > 0 else None
     include_re = re.compile(args.include, re.I) if args.include else None
     exclude_re = re.compile(args.exclude, re.I) if args.exclude else None
-    use_ansi = not args.no_ansi
 
-    if args.half_life <= 0: args.half_life = 30.0
-    decay = 1.0 - 2.0**(-args.hop / float(args.half_life))
-    hist = np.zeros(len(LABELS), dtype=np.float32)
+    # recency-weighted accumulator (decaying “so-far”)
+    cum_scores = np.zeros(NUM_CLASSES, dtype=np.float32)
+    last_seen  = np.full(NUM_CLASSES, -np.inf, dtype=np.float32)
+    last_accum_ts = time.time()
 
-    fam_comp, idx_to_fam = build_family_map()
-    fam_hist = np.zeros(len(fam_comp), dtype=np.float32)
+    def decay_cumulative(now_ts):
+        nonlocal last_accum_ts, cum_scores
+        dt = max(0.0, now_ts - last_accum_ts)
+        if dt > 0 and args.half_life > 0:
+            decay = 0.5 ** (dt / args.half_life)
+            cum_scores *= decay
+        last_accum_ts = now_ts
 
     print(f"Using input device #{input_idx}: {devinfo['name']}")
     print(f"Native SR {native_sr} Hz → resample → {TARGET_SR} Hz")
-    print(f"overall view = {'families' if args.family else 'labels'} | half_life={args.half_life:.1f}s | hop={args.hop:.2f}s | topk={args.topk}")
+    print(f"hop={args.hop:.2f}s  topk={args.topk}  half_life={args.half_life:.1f}s")
     print("(Ctrl+C to stop)\n")
 
-    _ = yamnet(np.zeros(FRAME_LEN, dtype=np.float32))
+    _ = yamnet(np.zeros(FRAME_LEN, dtype=np.float32))  # warmup
 
-    last = 0.0
-    with sd.InputStream(device=input_idx,
-                        samplerate=native_sr,
-                        channels=1,
-                        blocksize=hop_native,
-                        dtype="float32",
-                        callback=audio_cb,
-                        latency="low"):
-        while True:
-            buf = q.get()
-            meter_update(buf)
-            resampled = resample_poly(buf, up, down).astype(np.float32)
-            ring.extend(resampled)
-            if len(ring) < FRAME_LEN:
-                if time.time() - last > 0.5:
-                    lvl_db = 20*np.log10(level_ema + 1e-6)
-                    if use_ansi:
-                        clearline(use_ansi); print(f"[level ~ {lvl_db:5.1f} dB] filling buffer…", end="", flush=True)
+    ring = deque(maxlen=FRAME_LEN)
+    last_print_line = None
+    last_print_time = 0.0
+    started_at = time.time()
+
+    try:
+        with sd.InputStream(device=input_idx,
+                            samplerate=native_sr,
+                            channels=1,
+                            blocksize=hop_native,
+                            dtype="float32",
+                            callback=audio_cb,
+                            latency="low"):
+            while True:
+                buf = q.get()
+                resampled = resample_poly(buf, up, down).astype(np.float32)
+                ring.extend(resampled)
+                now = time.time()
+                if len(ring) < FRAME_LEN:
+                    continue
+
+                # model
+                window = np.array(ring, dtype=np.float32)
+                scores, _, _ = yamnet(window)
+                avg = scores.numpy().mean(axis=0)
+                if ema: avg = ema.update(avg)
+
+                # include/exclude + thresholds for contribution
+                mask = np.ones(NUM_CLASSES, dtype=bool)
+                if include_re:
+                    mask[:] = False
+                    for i, n in enumerate(LABELS):
+                        if include_re.search(n): mask[i] = True
+                if exclude_re:
+                    for i, n in enumerate(LABELS):
+                        if exclude_re.search(n): mask[i] = False
+                contrib = np.where(mask, avg, 0.0).astype(np.float32)
+                if args.min_prob > 0:
+                    contrib = np.where(contrib >= args.min_prob, contrib, 0.0).astype(np.float32)
+
+                # optional per-hop Speech cap before accumulation
+                try:
+                    idx_speech = LABELS.index("Speech")
+                except ValueError:
+                    idx_speech = None
+                if idx_speech is not None:
+                    if args.cap_when_others:
+                        if contrib[idx_speech] > args.speech_max_share and np.any(np.delete(contrib, idx_speech) > 0):
+                            contrib[idx_speech] = args.speech_max_share
                     else:
-                        print(f"[level ~ {lvl_db:5.1f} dB] filling buffer…", flush=True)
-                    last = time.time()
-                continue
+                        contrib[idx_speech] = min(contrib[idx_speech], args.speech_max_share)
 
-            window = np.array(ring, dtype=np.float32)
-            scores, _, _ = yamnet(window)
-            avg = scores.numpy().mean(axis=0)
-            if ema: avg = ema.update(avg)
+                # accumulate with decay
+                decay_cumulative(now)
+                if args.accum_min_prob > 0:
+                    contrib = np.where(contrib >= args.accum_min_prob, contrib, 0.0).astype(np.float32)
+                cum_scores += contrib
+                nz = np.where(contrib > 0)[0]
+                if nz.size: last_seen[nz] = now
 
-            hist = (1.0 - decay) * hist + decay * avg
+                # build CURRENT “so-far (recency)” list
+                fresh_mask = (now - last_seen) <= args.stale_seconds
+                eligible = np.where(fresh_mask & (cum_scores > 0))[0]
+                if eligible.size == 0:
+                    # if nothing fresh, allow single best so it’s not blank
+                    if np.max(cum_scores) > 0:
+                        eligible = np.array([int(np.argmax(cum_scores))])
+                    else:
+                        eligible = np.array([], dtype=int)
 
-            if args.family:
-                fam_hist *= (1.0 - decay)
-                for i, p in enumerate(avg):
-                    if p <= 0: continue
-                    fam_idxs = idx_to_fam[i]
-                    if not fam_idxs: continue
-                    inc = decay * p / max(1, len(fam_idxs))
-                    for fi in fam_idxs:
-                        fam_hist[fi] += inc
-                items = []
-                for fi, p in enumerate(fam_hist):
-                    name = fam_comp[fi][0]
-                    if include_re and not include_re.search(name): continue
-                    if exclude_re and exclude_re.search(name): continue
-                    items.append((name, float(p)))
-            else:
-                items = []
-                for i, p in enumerate(hist):
-                    name = LABELS[i]
-                    if include_re and not include_re.search(name): continue
-                    if exclude_re and exclude_re.search(name): continue
-                    items.append((name, float(p)))
+                totalsum = float(np.sum(cum_scores[eligible])) or 1.0
+                pairs = [(i, LABELS[i], float(cum_scores[i] / totalsum)) for i in eligible]
 
-            items.sort(key=lambda x: x[1], reverse=True)
-            items = items[:args.topk] if len(items) >= args.topk else items
+                if args.sofar_min_share > 0:
+                    pairs = [p for p in pairs if p[2] >= args.sofar_min_share]
+                    if not pairs and eligible.size:
+                        i0 = int(eligible[np.argmax(cum_scores[eligible])])
+                        pairs = [(i0, LABELS[i0], float(cum_scores[i0] / totalsum))]
 
-            if time.time() - last >= args.hop - 1e-3:
-                lvl_db = 20*np.log10(level_ema + 1e-6)
-                line = " | ".join(f"{n}: {p:.2f}" for n, p in items)
-                prefix = "overall-fam" if args.family else "overall"
-                if use_ansi:
-                    clearline(use_ansi); print(f"[level ~ {lvl_db:5.1f} dB] {prefix} → {line}", end="", flush=True)
+                pairs.sort(key=lambda x: x[2], reverse=True)
+                pairs = pairs[:args.topk]
+
+                # simplified one-line text (rounded shares)
+                line_struct = tuple((n, round(s, 2)) for _, n, s in pairs)
+                # only print if changed vs last line (labels or any share change > eps)
+                changed = False
+                if last_print_line is None or len(line_struct) != len(last_print_line):
+                    changed = True
                 else:
-                    print(f"[level ~ {lvl_db:5.1f} dB] {prefix} → {line}", flush=True)
-                last = time.time()
+                    for (n1, s1), (n2, s2) in zip(line_struct, last_print_line):
+                        if n1 != n2 or abs(s1 - s2) > args.change_eps:
+                            changed = True
+                            break
+
+                if changed:
+                    text = " | ".join(f"{n}: {s:.2f}" for n, s in line_struct) if line_struct else "(silence)"
+                    print(text, flush=True)
+                    last_print_line = line_struct
+                    last_print_time = now
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # final summary (top-k on decayed cum_scores, no staleness)
+        duration = time.time() - started_at
+        top_idx = np.argsort(-cum_scores)[:args.topk]
+        top = [(LABELS[i], float(cum_scores[i])) for i in top_idx if cum_scores[i] > 0]
+        tot = sum(v for _, v in top) or 1.0
+        print("\n===== summary =====")
+        print(f"duration: {duration:.1f}s  half_life: {args.half_life:.1f}s  hop: {args.hop:.2f}s")
+        for name, v in top:
+            print(f"{name:24s} share={v/tot:.2f} score={v:.3f}")
+        print("===================")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--device",   type=int, default=None)
     ap.add_argument("--hop",      type=float, default=HOP_SECS)
-    ap.add_argument("--topk",     type=int, default=10)
-    ap.add_argument("--smooth",   type=float, default=0.3)
+    ap.add_argument("--topk",     type=int, default=5)
+    ap.add_argument("--smooth",   type=float, default=0.30)
+    ap.add_argument("--min_prob", type=float, default=0.01)
     ap.add_argument("--include",  type=str, default=None)
-    ap.add_argument("--exclude",  type=str, default="")
-    ap.add_argument("--no_ansi", action="store_true")
+    ap.add_argument("--exclude",  type=str, default=None)
+
+    # recency accumulator
     ap.add_argument("--half_life", type=float, default=30.0)
-    ap.add_argument("--family", action="store_true")
+    ap.add_argument("--accum_min_prob", type=float, default=0.05)
+
+    # staleness & visibility
+    ap.add_argument("--stale_seconds",  type=float, default=45.0)
+    ap.add_argument("--sofar_min_share", type=float, default=0.02)
+
+    # speech capping
+    ap.add_argument("--speech_max_share", type=float, default=0.60)
+    ap.add_argument("--cap_when_others", action="store_true")
+
+    # change detection
+    ap.add_argument("--change_eps", type=float, default=0.01,
+                    help="Reprint only if any displayed share changes by > this amount or labels change")
+
     args, _ = ap.parse_known_args()
-    try:
-        main(args)
-    except KeyboardInterrupt:
-        print("\nStopped.")
+    main(args)
